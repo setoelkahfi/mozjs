@@ -151,6 +151,14 @@ ifneq ($(HOST),$(TARGET))
 		HOST_CXX ?= $(shell xcrun --find clang++)
 
 		ifeq (-apple-ios,$(findstring -apple-ios,$(TARGET)))
+			# Cargo passes IPHONEOS_DEPLOYMENT_TARGET to every child process.
+			# Keep mozbuild's host utilities executable on the build Mac: without
+			# explicit trailing macOS flags, clang stamps helpers such as nsinstall
+			# as iOS binaries, which cannot run while configuring SpiderMonkey.
+			HOST_SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path)
+			HOST_CFLAGS += -target $(shell uname -m)-apple-macos$(MACOSX_DEPLOYMENT_TARGET) -isysroot $(HOST_SDKROOT)
+			HOST_CXXFLAGS += -target $(shell uname -m)-apple-macos$(MACOSX_DEPLOYMENT_TARGET) -isysroot $(HOST_SDKROOT)
+			HOST_LDFLAGS += -target $(shell uname -m)-apple-macos$(MACOSX_DEPLOYMENT_TARGET) -isysroot $(HOST_SDKROOT)
 			# configure probes lld first and only falls back if the link
 			# fails. `ld64.lld` fails with "does not support linking for
 			# platform iOS", and configure reports "Couldn't find one that
@@ -246,6 +254,9 @@ maybe-configure:
 	  CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
 	  HOST_CC="$(HOST_CC)" \
 	  HOST_CXX="$(HOST_CXX)" \
+	  HOST_CFLAGS="$(HOST_CFLAGS)" \
+	  HOST_CXXFLAGS="$(HOST_CXXFLAGS)" \
+	  HOST_LDFLAGS="$(HOST_LDFLAGS)" \
 	  WASI_SYSROOT="$(WASI_SYSROOT)" \
 	  AS="$(AS)" AR="$(AR)" \
 	  $(JSSRC)/configure $(strip $(CONFIGURE_FLAGS)) || (cat config.log && exit 1) ; \
