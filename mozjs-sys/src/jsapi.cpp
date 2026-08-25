@@ -50,11 +50,17 @@
 #include "js/shadow/Shape.h"
 #include "jsfriendapi.h"
 
+namespace js {
+void DisableExtraThreads();
+}
+
 namespace glue {
 
 // Reexport some functions that are marked inline.
 
 bool JS_Init() { return ::JS_Init(); }
+
+void JS_DisableExtraThreads() { js::DisableExtraThreads(); }
 
 JS::RealmOptions* JS_NewRealmOptions() {
   JS::RealmOptions* result = new JS::RealmOptions;

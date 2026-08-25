@@ -38,7 +38,7 @@ use crate::glue::{
     GetIdVectorAddress, GetObjectVectorAddress, NewCompileOptions, SliceRootedIdVector,
 };
 use crate::jsapi;
-use crate::jsapi::glue::{DeleteRealmOptions, JS_Init, JS_NewRealmOptions};
+use crate::jsapi::glue::{DeleteRealmOptions, JS_DisableExtraThreads, JS_Init, JS_NewRealmOptions};
 use crate::jsapi::js;
 use crate::jsapi::js::frontend::InitialStencilAndDelazifications;
 use crate::jsapi::mozilla::Utf8Unit;
@@ -212,6 +212,16 @@ impl JSEngine {
             *state = EngineState::InitFailed;
             Err(JSEngineError::InitFailed)
         } else {
+            // iOS has a much tighter process thread budget than desktop
+            // platforms. Servo already owns several worker pools by the time
+            // the first runtime starts, and SpiderMonkey aborts if its global
+            // helper pool cannot create every requested thread. Run helper
+            // tasks synchronously on iOS, matching the JS shell's supported
+            // `--no-threads` mode.
+            #[cfg(target_os = "ios")]
+            unsafe {
+                JS_DisableExtraThreads();
+            }
             *state = EngineState::Initialized;
             Ok(JSEngine {
                 outstanding_handles: Arc::new(AtomicU32::new(0)),
