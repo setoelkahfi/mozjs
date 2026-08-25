@@ -131,11 +131,46 @@ ifneq ($(HOST),$(TARGET))
 			$(NULL)
 	endif
 
-	ifeq ($(WINDOWS),)
+	# Apple platforms have no `$(TARGET)-gcc`. Cross-compiling to iOS, or to
+	# the other macOS architecture, means running the host's clang with a
+	# `-target` triple, so the prefixed-toolchain default below would send
+	# configure looking for a compiler named `aarch64-apple-ios-gcc`.
+	#
+	# mozbuild already understands the rest of iOS: it finds the SDK through
+	# `xcrun` (or `--with-ios-sdk`), tells simulator targets apart from device
+	# ones, and adds `-isysroot` and `-mios-version-min` itself.
+	ifeq (apple,$(findstring apple,$(TARGET)))
+		APPLE := 1
+		# `xcrun` rather than a bare `clang` so this follows the same Xcode
+		# that `xcode-select` points at, which the signing pipeline pins.
+		CC ?= $(shell xcrun --find clang)
+		CPP ?= $(shell xcrun --find clang) -E
+		CXX ?= $(shell xcrun --find clang++)
+		AR ?= $(shell xcrun --find ar)
+		HOST_CC ?= $(shell xcrun --find clang)
+		HOST_CXX ?= $(shell xcrun --find clang++)
+
+		ifeq (-apple-ios,$(findstring -apple-ios,$(TARGET)))
+			# configure probes lld first and only falls back if the link
+			# fails. `ld64.lld` fails with "does not support linking for
+			# platform iOS", and configure reports "Couldn't find one that
+			# works" rather than trying the next candidate. Apple's own
+			# linker does work; mozbuild spells it `ld64` and turns that
+			# into `-fuse-ld=ld`.
+			CONFIGURE_FLAGS += --enable-linker=ld64
+		endif
+	else
+		APPLE :=
+	endif
+
+	ifeq ($(WINDOWS)$(APPLE),)
 		CC ?= $(TARGET)-gcc
 		CPP ?= $(TARGET)-gcc -E
 		CXX ?= $(TARGET)-g++
 		AR ?= $(TARGET)-ar
+	endif
+
+	ifeq ($(WINDOWS),)
 		CONFIGURE_FLAGS += --target=$(TARGET)
 	endif
 
