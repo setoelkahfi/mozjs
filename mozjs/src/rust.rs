@@ -38,7 +38,12 @@ use crate::glue::{
     GetIdVectorAddress, GetObjectVectorAddress, NewCompileOptions, SliceRootedIdVector,
 };
 use crate::jsapi;
-use crate::jsapi::glue::{DeleteRealmOptions, JS_DisableExtraThreads, JS_Init, JS_NewRealmOptions};
+use crate::jsapi::glue::{DeleteRealmOptions, JS_Init, JS_NewRealmOptions};
+// Only the iOS build regenerates the glue bindings from this fork's
+// jsapi.cpp. Every other Apple target links the pre-built upstream archive,
+// whose gluebindings.rs has no JS_DisableExtraThreads to import.
+#[cfg(target_os = "ios")]
+use crate::jsapi::glue::JS_DisableExtraThreads;
 use crate::jsapi::js;
 use crate::jsapi::js::frontend::InitialStencilAndDelazifications;
 use crate::jsapi::mozilla::Utf8Unit;
