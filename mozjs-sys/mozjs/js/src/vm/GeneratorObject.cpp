@@ -1,15 +1,15 @@
-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
- * vim: set ts=8 sts=2 et sw=2 tw=80:
- * This Source Code Form is subject to the terms of the Mozilla Public
+/* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "vm/GeneratorObject.h"
 
+#include "builtin/ModuleObject.h"  // js::ModuleObject, js::ModuleStatus
 #include "frontend/ParserAtom.h"
 #ifdef DEBUG
 #  include "js/friend/DumpFunctions.h"  // js::DumpObject, js::DumpValue
 #endif
+#include "js/friend/UsageStatistics.h"  // JSUseCounter
 #include "js/PropertySpec.h"
 #include "vm/AsyncFunction.h"
 #include "vm/AsyncIteration.h"
@@ -27,10 +27,15 @@ AbstractGeneratorObject* AbstractGeneratorObject::create(
     JSContext* cx, HandleFunction callee, HandleScript script,
     HandleObject environmentChain, Handle<ArgumentsObject*> argsObject) {
   Rooted<AbstractGeneratorObject*> genObj(cx);
+  // TODO(Bug 2039389): Remove generator use counters
   if (!callee->isAsync()) {
     genObj = GeneratorObject::create(cx, callee);
+    cx->runtime()->setUseCounter(cx->global(),
+                                 JSUseCounter::GENERATOR_FUNCTION_CREATED);
   } else if (callee->isGenerator()) {
     genObj = AsyncGeneratorObject::create(cx, callee);
+    cx->runtime()->setUseCounter(
+        cx->global(), JSUseCounter::ASYNC_GENERATOR_FUNCTION_CREATED);
   } else {
     genObj = AsyncFunctionGeneratorObject::create(cx, callee);
   }
@@ -217,20 +222,32 @@ static AbstractGeneratorObject* GetGeneratorObjectForCall(JSContext* cx,
              : nullptr;
 }
 
+AbstractGeneratorObject* js::GetGeneratorObjectForModule(ModuleObject* module) {
+  ModuleEnvironmentObject* moduleEnv = module->environment();
+  if (!moduleEnv) {
+    return nullptr;
+  }
+
+  PropertyName* name =
+      module->runtimeFromMainThread()->commonNames->dot_generator_;
+  mozilla::Maybe<PropertyInfo> prop = moduleEnv->lookupPure(name);
+  if (prop.isNothing()) {
+    return nullptr;
+  }
+
+  Value genValue = moduleEnv->getSlot(prop->slot());
+  return genValue.isObject()
+             ? &genValue.toObject().as<AbstractGeneratorObject>()
+             : nullptr;
+}
+
 AbstractGeneratorObject* js::GetGeneratorObjectForFrame(
     JSContext* cx, AbstractFramePtr frame) {
   cx->check(frame);
   MOZ_ASSERT(frame.isGeneratorFrame());
 
   if (frame.isModuleFrame()) {
-    ModuleEnvironmentObject* moduleEnv =
-        frame.script()->module()->environment();
-    mozilla::Maybe<PropertyInfo> prop =
-        moduleEnv->lookup(cx, cx->names().dot_generator_);
-    Value genValue = moduleEnv->getSlot(prop->slot());
-    return genValue.isObject()
-               ? &genValue.toObject().as<AbstractGeneratorObject>()
-               : nullptr;
+    return GetGeneratorObjectForModule(frame.script()->module());
   }
   if (!frame.hasInitialEnvironment()) {
     return nullptr;
@@ -308,13 +325,20 @@ bool AbstractGeneratorObject::resume(JSContext* cx,
 GeneratorObject* GeneratorObject::create(JSContext* cx, HandleFunction fun) {
   MOZ_ASSERT(fun->isGenerator() && !fun->isAsync());
 
-  // FIXME: This would be faster if we could avoid doing a lookup to get
-  // the prototype for the instance.  Bug 906600.
-  RootedValue pval(cx);
-  if (!GetProperty(cx, fun, fun, cx->names().prototype, &pval)) {
+  // In general, we have to look up the prototype for the instance here
+  // (although it would be nice if we could avoid it somehow; see bug 906600.)
+  // Self-hosted generators are only used to implement iterator helpers, which
+  // are specified as abstract closures. They always use the default prototype
+  // instead of reading it from the constructor.
+  // See https://tc39.es/ecma262/#sec-createiteratorfromclosure.
+  RootedTuple<Value, JSObject*> roots(cx);
+  RootedField<Value, 0> pval(roots);
+  if (!fun->isSelfHostedBuiltin() &&
+      !GetProperty(cx, fun, fun, cx->names().prototype, &pval)) {
     return nullptr;
   }
-  RootedObject proto(cx, pval.isObject() ? &pval.toObject() : nullptr);
+  RootedField<JSObject*, 1> proto(roots,
+                                  pval.isObject() ? &pval.toObject() : nullptr);
   if (!proto) {
     proto = GlobalObject::getOrCreateGeneratorObjectPrototype(cx, cx->global());
     if (!proto) {
@@ -331,16 +355,7 @@ const JSClass GeneratorObject::class_ = {
 };
 
 const JSClassOps GeneratorObject::classOps_ = {
-    nullptr,                                   // addProperty
-    nullptr,                                   // delProperty
-    nullptr,                                   // enumerate
-    nullptr,                                   // newEnumerate
-    nullptr,                                   // resolve
-    nullptr,                                   // mayResolve
-    nullptr,                                   // finalize
-    nullptr,                                   // call
-    nullptr,                                   // construct
-    CallTraceMethod<AbstractGeneratorObject>,  // trace
+    .trace = CallTraceMethod<AbstractGeneratorObject>,
 };
 
 static const JSFunctionSpec generator_methods[] = {
@@ -450,6 +465,21 @@ void AbstractGeneratorObject::setUnaliasedLocal(uint32_t slot,
 }
 
 void AbstractGeneratorObject::setClosed(JSContext* cx) {
+  // If the top-level await generator is suspended in
+  // ModuleObject::onTopLevelEvaluationFinished, clear the ScriptSlot since
+  // the generator is closed. The callee slot is not an object if this
+  // generator has already been closed.
+  const Value& calleeVal = getFixedSlot(CALLEE_SLOT);
+  if (calleeVal.isObject()) {
+    JSScript* script = calleeVal.toObject().as<JSFunction>().nonLazyScript();
+    if (script->isModule()) {
+      ModuleObject* module = script->module();
+      if (module->status() == ModuleStatus::Evaluated) {
+        module->setReservedSlot(ModuleObject::ScriptSlot, UndefinedValue());
+      }
+    }
+  }
+
   setFixedSlot(CALLEE_SLOT, NullValue());
   setFixedSlot(ENV_CHAIN_SLOT, NullValue());
   setFixedSlot(ARGS_OBJ_SLOT, NullValue());

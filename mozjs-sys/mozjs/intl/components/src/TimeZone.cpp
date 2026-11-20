@@ -16,10 +16,78 @@
 
 namespace mozilla::intl {
 
+static constexpr std::string_view LegacyPOSIXTimeZones[] = {
+    "CST6CDT",
+    "EST5EDT",
+    "MST7MDT",
+    "PST8PDT",
+};
+
+static constexpr const char* LegacyPOSIXTimeZoneCities[] = {
+    "America/Chicago",
+    "America/New_York",
+    "America/Denver",
+    "America/Los_Angeles",
+};
+
+static constexpr const char16_t* LegacyPOSIXTimeZoneCitiesUTF16[] = {
+    u"America/Chicago",
+    u"America/New_York",
+    u"America/Denver",
+    u"America/Los_Angeles",
+};
+
+template <typename C>
+static Maybe<size_t> LegacyPOSIXTimeZoneIndex(Span<const C> aTimeZone) {
+  for (size_t i = 0; i < std::size(LegacyPOSIXTimeZones); i++) {
+    const auto& legacy = LegacyPOSIXTimeZones[i];
+    if (std::equal(aTimeZone.begin(), aTimeZone.end(), legacy.begin(),
+                   legacy.end())) {
+      return Some(i);
+    }
+  }
+  return Nothing();
+}
+
 /* static */
-Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
+Span<const char> TimeZone::ResolveLegacyPOSIXTimeZone(
+    Span<const char> aTimeZone) {
+  if (auto index = LegacyPOSIXTimeZoneIndex(aTimeZone)) {
+    return MakeStringSpan(LegacyPOSIXTimeZoneCities[*index]);
+  }
+  return aTimeZone;
+}
+
+/* static */
+Span<const char16_t> TimeZone::ResolveLegacyPOSIXTimeZone(
+    Span<const char16_t> aTimeZone) {
+  if (auto index = LegacyPOSIXTimeZoneIndex(aTimeZone)) {
+    return MakeStringSpan(LegacyPOSIXTimeZoneCitiesUTF16[*index]);
+  }
+  return aTimeZone;
+}
+
+/* static */
+Result<Maybe<Span<const char16_t>>, ICUError>
+TimeZone::ResolveLegacyPOSIXTimeZone(
     Maybe<Span<const char16_t>> aTimeZoneOverride) {
-  const UChar* zoneID = nullptr;
+  if (aTimeZoneOverride) {
+    return Some(ResolveLegacyPOSIXTimeZone(*aTimeZoneOverride));
+  }
+
+  Vector<char16_t, TimeZoneIdentifierLength> id;
+  VectorToBufferAdaptor buffer(id);
+  MOZ_TRY(GetDefaultTimeZone(buffer));
+  if (auto index = LegacyPOSIXTimeZoneIndex(
+          Span<const char16_t>(id.begin(), id.length()))) {
+    return Some(MakeStringSpan(LegacyPOSIXTimeZoneCitiesUTF16[*index]));
+  }
+  return Maybe<Span<const char16_t>>{};
+}
+
+static Result<UniquePtr<TimeZone>, ICUError> TryCreateTimeZone(
+    Maybe<Span<const char>> aTimeZoneOverride) {
+  const char* zoneID = nullptr;
   int32_t zoneIDLen = 0;
   if (aTimeZoneOverride) {
     zoneIDLen = static_cast<int32_t>(aTimeZoneOverride->Length());
@@ -29,8 +97,8 @@ Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
 #if MOZ_INTL_USE_ICU_CPP_TIMEZONE
   UniquePtr<icu::TimeZone> tz;
   if (zoneID) {
-    tz.reset(
-        icu::TimeZone::createTimeZone(icu::UnicodeString(zoneID, zoneIDLen)));
+    tz.reset(icu::TimeZone::createTimeZone(
+        icu::UnicodeString(zoneID, zoneIDLen, icu::UnicodeString::kInvariant)));
   } else {
     tz.reset(icu::TimeZone::createDefault());
   }
@@ -42,6 +110,15 @@ Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
 
   return MakeUnique<TimeZone>(std::move(tz));
 #else
+  const char16_t* zoneIDChar16 = nullptr;
+  Vector<char16_t, TimeZone::TimeZoneIdentifierLength> zoneIDChars;
+  if (zoneID) {
+    if (!zoneIDChars.append(zoneID, zoneIDLen)) {
+      return Err(ICUError::OutOfMemory);
+    }
+    zoneIDChar16 = zoneIDChars.begin();
+  }
+
   // An empty string is used for the root locale. This is regarded as the base
   // locale of all locales, and is used as the language/country neutral locale
   // for locale sensitive operations.
@@ -49,7 +126,7 @@ Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
 
   UErrorCode status = U_ZERO_ERROR;
   UCalendar* calendar =
-      ucal_open(zoneID, zoneIDLen, rootLocale, UCAL_DEFAULT, &status);
+      ucal_open(zoneIDChar16, zoneIDLen, rootLocale, UCAL_DEFAULT, &status);
 
   if (U_FAILURE(status)) {
     return Err(ToICUError(status));
@@ -70,6 +147,32 @@ Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
 
   return MakeUnique<TimeZone>(calendar);
 #endif
+}
+
+/* static */
+Result<UniquePtr<TimeZone>, ICUError> TimeZone::TryCreate(
+    Maybe<Span<const char>> aTimeZoneOverride) {
+  if (aTimeZoneOverride) {
+    return TryCreateTimeZone(
+        Some(ResolveLegacyPOSIXTimeZone(*aTimeZoneOverride)));
+  }
+
+  auto result = TryCreateTimeZone(Nothing());
+  if (result.isErr()) {
+    return result.propagateErr();
+  }
+  UniquePtr<TimeZone> timeZone = result.unwrap();
+
+  // The default time zone can also be one of the legacy POSIX time zones.
+  Vector<char16_t, TimeZoneIdentifierLength> id;
+  VectorToBufferAdaptor buffer(id);
+  MOZ_TRY(timeZone->GetId(buffer));
+  if (auto index = LegacyPOSIXTimeZoneIndex(
+          Span<const char16_t>(id.begin(), id.length()))) {
+    return TryCreateTimeZone(
+        Some(MakeStringSpan(LegacyPOSIXTimeZoneCities[*index])));
+  }
+  return timeZone;
 }
 
 Result<int32_t, ICUError> TimeZone::GetRawOffsetMs() {
@@ -388,14 +491,22 @@ Result<Span<const char>, ICUError> TimeZone::GetTZDataVersion() {
 }
 
 Result<SpanEnumeration<char>, ICUError> TimeZone::GetAvailableTimeZones(
-    const char* aRegion) {
+    const RegionSubtag& aRegion) {
+  auto regionSpan = aRegion.Span();
+  MOZ_ASSERT(IsStructurallyValidRegionTag(regionSpan));
+
+  // Zero-terminated region string.
+  char region[LanguageTagLimits::RegionLength + 1] = {};
+  std::copy_n(regionSpan.Elements(), regionSpan.Length(), region);
+
   // Get the time zones that are commonly used in the given region. Uses the
-  // UCAL_ZONE_TYPE_ANY filter so we have more fine-grained control over the
-  // returned time zones and don't omit time zones which are considered links in
-  // ICU, but are treated as proper zones in IANA.
+  // UCAL_ZONE_TYPE_CANONICAL filter so we have more fine-grained control over
+  // the returned time zones. Otherwise ICU can return time zones attached to
+  // other countries, for example the time zone id "Iceland" is returned when
+  // requesting all times zones for "CI" (Ivory Coast).
   UErrorCode status = U_ZERO_ERROR;
   UEnumeration* enumeration = ucal_openTimeZoneIDEnumeration(
-      UCAL_ZONE_TYPE_ANY, aRegion, nullptr, &status);
+      UCAL_ZONE_TYPE_CANONICAL, region, nullptr, &status);
   if (U_FAILURE(status)) {
     return Err(ToICUError(status));
   }

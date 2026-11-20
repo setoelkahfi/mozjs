@@ -4,11 +4,35 @@
 
 #include "mozilla/intl/Calendar.h"
 
+#include <algorithm>
+#include <string_view>
+
+#include "mozilla/intl/TimeZone.h"
 #include "unicode/ucal.h"
 #include "unicode/uloc.h"
 #include "unicode/utypes.h"
 
 namespace mozilla::intl {
+
+class UndRegion {
+  static constexpr std::string_view und = "und";
+
+  // Zero-terminated locale string.
+  char mLocale[und.length() + LanguageTagLimits::RegionLength + 2] = {};
+
+ public:
+  explicit UndRegion(const RegionSubtag& aRegion) {
+    auto region = aRegion.Span();
+    MOZ_ASSERT(IsStructurallyValidRegionTag(region));
+
+    // Make a full locale identifier.
+    auto* out = std::copy_n(und.data(), und.size(), mLocale);
+    *out++ = '-';
+    std::copy_n(region.data(), region.size(), out);
+  }
+
+  operator const char*() const { return mLocale; }
+};
 
 /* static */
 Result<UniquePtr<Calendar>, ICUError> Calendar::TryCreate(
@@ -16,6 +40,12 @@ Result<UniquePtr<Calendar>, ICUError> Calendar::TryCreate(
   UErrorCode status = U_ZERO_ERROR;
   const UChar* zoneID = nullptr;
   int32_t zoneIDLen = 0;
+  auto resolvedTimeZone =
+      TimeZone::ResolveLegacyPOSIXTimeZone(aTimeZoneOverride);
+  if (resolvedTimeZone.isErr()) {
+    return resolvedTimeZone.propagateErr();
+  }
+  aTimeZoneOverride = resolvedTimeZone.unwrap();
   if (aTimeZoneOverride) {
     zoneIDLen = static_cast<int32_t>(aTimeZoneOverride->Length());
     zoneID = aTimeZoneOverride->Elements();
@@ -29,6 +59,12 @@ Result<UniquePtr<Calendar>, ICUError> Calendar::TryCreate(
   }
 
   return MakeUnique<Calendar>(calendar);
+}
+
+/* static */
+Result<UniquePtr<Calendar>, ICUError> Calendar::TryCreate(
+    const RegionSubtag& aRegion) {
+  return TryCreate(UndRegion{aRegion});
 }
 
 Result<Span<const char>, ICUError> Calendar::GetBcp47Type() {
@@ -125,20 +161,6 @@ Result<Ok, ICUError> Calendar::SetTimeInMs(double aUnixEpoch) {
 }
 
 /* static */
-Result<SpanEnumeration<char>, ICUError>
-Calendar::GetLegacyKeywordValuesForLocale(const char* aLocale) {
-  UErrorCode status = U_ZERO_ERROR;
-  UEnumeration* enumeration = ucal_getKeywordValuesForLocale(
-      "calendar", aLocale, /* commonlyUsed */ false, &status);
-
-  if (U_SUCCESS(status)) {
-    return SpanEnumeration<char>(enumeration);
-  }
-
-  return Err(ToICUError(status));
-}
-
-/* static */
 SpanResult<char> Calendar::LegacyIdentifierToBcp47(const char* aIdentifier,
                                                    int32_t aLength) {
   if (aIdentifier == nullptr) {
@@ -162,6 +184,13 @@ Calendar::GetBcp47KeywordValuesForLocale(const char* aLocale,
   }
 
   return Err(ToICUError(status));
+}
+
+/* static */
+Result<Calendar::Bcp47IdentifierEnumeration, ICUError>
+Calendar::GetBcp47KeywordValuesForRegion(const RegionSubtag& aRegion,
+                                         CommonlyUsed aCommonlyUsed) {
+  return GetBcp47KeywordValuesForLocale(UndRegion{aRegion}, aCommonlyUsed);
 }
 
 Calendar::~Calendar() {

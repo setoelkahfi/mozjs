@@ -19,13 +19,13 @@ jobs:
     if: ${{ github.event_name == 'schedule' }}
     uses: ./.github/workflows/build.yml
     with:
-      rust_version: 'stable'
+      rust_version: "stable"
     secrets: inherit
   latest_beta_rust:
     if: ${{ github.event_name == 'schedule' }}
     uses: ./.github/workflows/build.yml
     with:
-      rust_version: 'beta'
+      rust_version: "beta"
     secrets: inherit
 
   # The goal is to have an LTS branch of mozjs, where the rust API (mozjs and mozjs_sys glue code)
@@ -53,7 +53,6 @@ jobs:
             echo "You forgot to add the `-lts` suffix to the mozjs_sys version number. This is required on the lts branch"
             exit 1
           fi
-
 
   build_result:
     name: Result

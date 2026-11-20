@@ -30,10 +30,10 @@
 #include "mozilla/Casting.h"
 #include "mozilla/intl/ICU4CGlue.h"
 #include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/Locale.h"
 #include "mozilla/Maybe.h"
 #include "mozilla/Result.h"
 #include "mozilla/Span.h"
-#include "mozilla/Try.h"
 #include "mozilla/UniquePtr.h"
 
 namespace mozilla::intl {
@@ -72,7 +72,30 @@ class TimeZone final {
    * Create a TimeZone.
    */
   static Result<UniquePtr<TimeZone>, ICUError> TryCreate(
-      Maybe<Span<const char16_t>> aTimeZoneOverride = Nothing{});
+      Maybe<Span<const char>> aTimeZoneOverride = Nothing{});
+
+  /**
+   * Returns the identifier of the corresponding city time zone when |aTimeZone|
+   * is one of the legacy POSIX time zones CST6CDT, EST5EDT, MST7MDT, or
+   * PST8PDT. Otherwise returns |aTimeZone| unchanged.
+   *
+   * tzdata 2026d made these time zones again, but ICU provides neither
+   * localized names nor the rules of the city time zones for them. They must
+   * not be exposed as separate time zones.
+   * See <https://github.com/tc39/ecma402/issues/1103>.
+   *
+   * Every function which passes a time zone identifier to ICU should apply
+   * this function first.
+   */
+  static Span<const char> ResolveLegacyPOSIXTimeZone(
+      Span<const char> aTimeZone);
+  static Span<const char16_t> ResolveLegacyPOSIXTimeZone(
+      Span<const char16_t> aTimeZone);
+
+  // An absent override resolves the default zone if it is legacy POSIX, or
+  // remains absent so ICU can use its default zone unchanged.
+  static Result<Maybe<Span<const char16_t>>, ICUError>
+  ResolveLegacyPOSIXTimeZone(Maybe<Span<const char16_t>> aTimeZoneOverride);
 
   /**
    * A number indicating the raw offset from GMT in milliseconds.
@@ -254,7 +277,7 @@ class TimeZone final {
    * region.
    */
   static Result<SpanEnumeration<char>, ICUError> GetAvailableTimeZones(
-      const char* aRegion);
+      const RegionSubtag& aRegion);
 
   /**
    * Return an enumeration over all available time zones.

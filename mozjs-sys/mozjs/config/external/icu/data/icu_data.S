@@ -13,7 +13,9 @@
 #endif
 
 .global ICU_DATA_SYMBOL
-#if defined(__APPLE__)
+#if defined(_WIN32)
+.section .rodata, "dr"
+#elif defined(__APPLE__)
 .data
 .const
 #elif defined(__wasi__)
@@ -21,6 +23,7 @@
 #else
 .section .rodata
 #endif
+.ascii ICU_DATA_HASH
 .balign 16
 ICU_DATA_SYMBOL:
 .incbin ICU_DATA_FILE

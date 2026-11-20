@@ -217,6 +217,25 @@ fn build_spidermonkey(build_dir: &Path) {
         }
     }
 
+    let include = env::var("DEP_NORMALIZER_GLUE_INCLUDE")
+        .expect("DEP_NORMALIZER_GLUE_INCLUDE should be set by normalizer_glue");
+    write!(cppflags, "-I{} ", include.replace("\\", "/")).unwrap();
+
+    if cfg!(feature = "intl") {
+        let include = env::var("DEP_UNICODE_BIDI_FFI_INCLUDE")
+            .expect("DEP_UNICODE_BIDI_FFI_INCLUDE should be set by unicode_bidi_ffi");
+        write!(cppflags, "-I{} ", include.replace("\\", "/")).unwrap();
+        let include = env::var("DEP_PROPERTIES_GLUE_INCLUDE")
+            .expect("DEP_PROPERTIES_GLUE_INCLUDE should be set by properties_glue");
+        write!(cppflags, "-I{} ", include.replace("\\", "/")).unwrap();
+        let include = env::var("DEP_COLLATOR_GLUE_INCLUDE")
+            .expect("DEP_COLLATOR_GLUE_INCLUDE should be set by collator_glue");
+        write!(cppflags, "-I{} ", include.replace("\\", "/")).unwrap();
+        let include = env::var("DEP_LOCALE_GLUE_INCLUDE")
+            .expect("DEP_LOCALE_GLUE_INCLUDE should be set by locale_glue");
+        write!(cppflags, "-I{} ", include.replace("\\", "/")).unwrap();
+    }
+
     cppflags.push(get_cc_rs_env_os("CPPFLAGS").unwrap_or_default());
     cmd.env("CPPFLAGS", cppflags);
 
@@ -271,6 +290,7 @@ fn build_spidermonkey(build_dir: &Path) {
 
     if target.contains("windows") {
         let mut make_static = cc::Build::new();
+        make_static.prefer_clang_cl_over_msvc(true);
         make_static.out_dir(join_path(build_dir, "js/src/build"));
         fs::read_to_string(join_path(build_dir, "js/src/build/js_static_lib.list"))
             .unwrap()
@@ -528,6 +548,8 @@ fn minimum_rust_target() -> RustTarget {
 fn get_common_cc(build_dir: &Path, target: BuildTarget) -> cc::Build {
     let mut builder = cc::Build::new();
 
+    builder.prefer_clang_cl_over_msvc(true);
+
     let target_triple = env::var("TARGET").unwrap();
 
     // Must be set before any `get_compiler()` call.
@@ -535,7 +557,7 @@ fn get_common_cc(build_dir: &Path, target: BuildTarget) -> cc::Build {
 
     if target_triple.contains("windows") {
         builder
-            .std("c++17")
+            .std("c++20")
             .flag_if_supported("-Zi")
             .flag_if_supported("-GR-")
             .define("WIN32", None)
@@ -545,7 +567,7 @@ fn get_common_cc(build_dir: &Path, target: BuildTarget) -> cc::Build {
             .define("_CRT_USE_BUILTIN_OFFSETOF", None);
     } else {
         builder
-            .std("gnu++17")
+            .std("gnu++20")
             .pic(true)
             .flag_if_supported("-fno-rtti")
             .flag_if_supported("-fno-sized-deallocation")
@@ -884,6 +906,7 @@ impl BuildTarget {
                 "JS::DecodeMultiStencilsOffThread",
                 "JS::DecodeStencilOffThread",
                 "JS::DescribeScriptedCaller",
+                "JS::DequeueNextMicroTask",
                 "JS::EncodeStencil",
                 "JS::FinishDecodeMultiStencilsOffThread",
                 "JS::FinishIncrementalEncoding",
@@ -952,6 +975,7 @@ impl BuildTarget {
                 "JS::PersistentRooted.*",
                 "JS::detail::CallArgsBase.*",
                 "js::detail::UniqueSelector.*",
+                "std::unique_ptr",
                 "mozilla::BufferList",
                 "mozilla::Maybe.*",
                 "mozilla::UniquePtr.*",
@@ -1119,14 +1143,6 @@ mod archive {
         Ok(())
     }
 
-    static ATTESTATION_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-        Command::new("gh")
-            .arg("attestation")
-            .arg("--help")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    });
-
     enum AttestationType {
         /// Fallback to compiling from source on failure
         Lenient,
@@ -1182,13 +1198,6 @@ mod archive {
     /// Use GitHub artifact attestation to verify the artifact is not corrupt.
     fn attest_artifact(kind: AttestationType, archive_path: &Path) -> Result<(), std::io::Error> {
         let start = Instant::now();
-        if !*ATTESTATION_AVAILABLE {
-            println!(
-                "cargo:warning=Artifact attestation enabled, but not available. \
-                     Please refer to the documentation for available values for {}",
-                ArtifactAttestation::ENV_VAR_NAME
-            );
-        }
         let mut attestation_cmd = Command::new("gh");
         attestation_cmd
             .arg("attestation")
@@ -1203,20 +1212,32 @@ mod archive {
             attestation_duration.as_millis()
         );
 
-        if let Err(output) = attestation_cmd.output() {
-            println!("cargo:warning=Failed to verify the artifact downloaded from CI: {output:?}");
-            // Remove the file so the build-script will redownload next time.
-            let _ = fs::remove_file(&archive_path).inspect_err(|e| {
-                println!("cargo:warning=Failed to delete archive: {e}");
-            });
-            match kind {
-                AttestationType::Strict => panic!("Artifact verification failed!"),
-                AttestationType::Lenient => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-                }
+        match attestation_cmd.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Err(error) => {
+                println!(
+                    "cargo:warning=Artifact attestation enabled, but not available. \
+                     Please refer to the documentation for available values for {}",
+                    ArtifactAttestation::ENV_VAR_NAME
+                );
+            }
+            Ok(output) => {
+                println!(
+                    "cargo:warning=Failed to verify the artifact downloaded from CI: {output:?}"
+                );
             }
         }
-        Ok(())
+        // Attestation failed:
+        // Remove the file so the build-script will redownload next time.
+        let _ = fs::remove_file(&archive_path).inspect_err(|e| {
+            println!("cargo:warning=Failed to delete archive: {e}");
+        });
+        match kind {
+            AttestationType::Strict => panic!("Artifact verification failed!"),
+            AttestationType::Lenient => {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+        }
     }
 
     /// Download the SpiderMonkey archive with cURL using the provided base URL. If it's None,

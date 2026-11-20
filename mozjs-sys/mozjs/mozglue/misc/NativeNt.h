@@ -1,5 +1,3 @@
-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -16,9 +14,8 @@
 #include <type_traits>
 #include <utility>
 
-#include "mozilla/ArrayUtils.h"
 #include "mozilla/Attributes.h"
-#include "mozilla/DebugOnly.h"
+#include "mozilla/CheckedArithmetic.h"
 #include "mozilla/Maybe.h"
 #include "mozilla/Range.h"
 #include "mozilla/Span.h"
@@ -60,6 +57,13 @@ NTSTATUS NTAPI NtMapViewOfSection(
     SIZE_T aCommitSize, PLARGE_INTEGER aSectionOffset, PSIZE_T aViewSize,
     SECTION_INHERIT aInheritDisposition, ULONG aAllocationType,
     ULONG aProtectionFlags);
+
+NTSTATUS NTAPI NtCreateSection(PHANDLE aSectionHandle,
+                               ACCESS_MASK aDesiredAccess,
+                               POBJECT_ATTRIBUTES aObjectAttributes,
+                               PLARGE_INTEGER aMaximumSize,
+                               ULONG aSectionPageProtection,
+                               ULONG aAllocationAttributes, HANDLE aFileHandle);
 
 NTSTATUS NTAPI NtUnmapViewOfSection(HANDLE aProcess, PVOID aBaseAddress);
 
@@ -108,6 +112,13 @@ VOID NTAPI RtlRunOnceInitialize(PRTL_RUN_ONCE aRunOnce);
 NTSTATUS NTAPI NtReadVirtualMemory(HANDLE aProcessHandle, PVOID aBaseAddress,
                                    PVOID aBuffer, SIZE_T aNumBytesToRead,
                                    PSIZE_T aNumBytesRead);
+
+NTSTATUS NTAPI NtDuplicateObject(HANDLE aSourceProcessHandle,
+                                 HANDLE aSourceHandle,
+                                 HANDLE aTargetProcessHandle,
+                                 PHANDLE aTargetHandle,
+                                 ACCESS_MASK aDesiredAccess,
+                                 ULONG aHandleAttributes, ULONG aOptions);
 
 NTSTATUS NTAPI LdrLoadDll(PWCHAR aDllPath, PULONG aFlags,
                           PUNICODE_STRING aDllName, PHANDLE aOutHandle);
@@ -1590,7 +1601,7 @@ class CrossExecTransferManager final {
   AutoVirtualProtect Protect(void* aLocalAddress, size_t aLength,
                              DWORD aProtFlags) {
     // If EnsureRemoteImagebase() fails, a subsequent operaion will fail.
-    Unused << EnsureRemoteImagebase();
+    (void)EnsureRemoteImagebase();
     return AutoVirtualProtect(LocalExecToRemoteExec(aLocalAddress), aLength,
                               aProtFlags, mRemoteProcess);
   }
@@ -1703,32 +1714,34 @@ class RtlAllocPolicy {
  public:
   template <typename T>
   T* maybe_pod_malloc(size_t aNumElems) {
-    if (aNumElems & mozilla::tl::MulOverflowMask<sizeof(T)>::value) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNumElems, sizeof(T), &size))) {
       return nullptr;
     }
 
-    return static_cast<T*>(
-        ::RtlAllocateHeap(RtlGetProcessHeap(), 0, aNumElems * sizeof(T)));
+    return static_cast<T*>(::RtlAllocateHeap(RtlGetProcessHeap(), 0, size));
   }
 
   template <typename T>
   T* maybe_pod_calloc(size_t aNumElems) {
-    if (aNumElems & mozilla::tl::MulOverflowMask<sizeof(T)>::value) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNumElems, sizeof(T), &size))) {
       return nullptr;
     }
 
-    return static_cast<T*>(::RtlAllocateHeap(
-        RtlGetProcessHeap(), HEAP_ZERO_MEMORY, aNumElems * sizeof(T)));
+    return static_cast<T*>(
+        ::RtlAllocateHeap(RtlGetProcessHeap(), HEAP_ZERO_MEMORY, size));
   }
 
   template <typename T>
   T* maybe_pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
-    if (aNewSize & mozilla::tl::MulOverflowMask<sizeof(T)>::value) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNewSize, sizeof(T), &size))) {
       return nullptr;
     }
 
-    return static_cast<T*>(::RtlReAllocateHeap(RtlGetProcessHeap(), 0, aPtr,
-                                               aNewSize * sizeof(T)));
+    return static_cast<T*>(
+        ::RtlReAllocateHeap(RtlGetProcessHeap(), 0, aPtr, size));
   }
 
   template <typename T>
@@ -1754,6 +1767,51 @@ class RtlAllocPolicy {
   void reportAllocOverflow() const {}
 
   [[nodiscard]] bool checkSimulatedOOM() const { return true; }
+};
+
+/**
+ * A minimal owning wrapper for a handle, closed with NtClose.
+ *
+ * Code reachable from the DLL blocklist hooks cannot use nsAutoHandle (XPCOM)
+ * or UniqueFileHandle, whose deleters call kernel32's CloseHandle: those hooks
+ * can run before kernel32.dll is available, which is why
+ * Kernel32ExportsSolver exists. NtClose is in ntdll and is always callable,
+ * in the launcher process and inside XUL alike.
+ */
+class AutoHandle final {
+ public:
+  AutoHandle() : mHandle(nullptr) {}
+  explicit AutoHandle(HANDLE aHandle) : mHandle(aHandle) {}
+  ~AutoHandle() { reset(); }
+
+  AutoHandle(AutoHandle&& aOther) : mHandle(aOther.mHandle) {
+    aOther.mHandle = nullptr;
+  }
+
+  AutoHandle& operator=(AutoHandle&& aOther) {
+    if (this != &aOther) {
+      reset();
+      mHandle = aOther.mHandle;
+      aOther.mHandle = nullptr;
+    }
+    return *this;
+  }
+
+  AutoHandle(const AutoHandle&) = delete;
+  AutoHandle& operator=(const AutoHandle&) = delete;
+
+  HANDLE get() const { return mHandle; }
+  explicit operator bool() const { return !!mHandle; }
+
+  void reset() {
+    if (mHandle) {
+      ::NtClose(mHandle);
+      mHandle = nullptr;
+    }
+  }
+
+ private:
+  HANDLE mHandle;
 };
 
 class AutoMappedView final {

@@ -1,13 +1,12 @@
-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
- * vim: set ts=8 sts=2 et sw=2 tw=80:
- */
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "builtin/WeakSetObject.h"
 #include "gc/Zone.h"
-#include "js/Array.h"               // JS::GetArrayLength
-#include "js/Exception.h"           // JS_IsExceptionPending
+#include "js/Array.h"      // JS::GetArrayLength
+#include "js/Exception.h"  // JS_IsExceptionPending
+#include "js/friend/CycleCollector.h"
 #include "js/GlobalObject.h"        // JS_NewGlobalObject
 #include "js/PropertyAndElement.h"  // JS_DefineProperty
 #include "js/WeakMap.h"
@@ -90,7 +89,8 @@ BEGIN_TEST(testWeakMap_setWeakMapEntry_invalid_key) {
   JS::Rooted<JS::Value> exn(cx);
   CHECK(JS_GetPendingException(cx, &exn));
   JS::Rooted<JSObject*> obj(cx, &exn.toObject());
-  JSErrorReport* err = JS_ErrorFromException(cx, obj);
+  JS::BorrowedErrorReport err(cx);
+  CHECK(JS_ErrorFromException(cx, obj, err));
   CHECK(err->exnType == JSEXN_TYPEERR);
 
   JS_ClearPendingException(cx);
@@ -104,7 +104,6 @@ BEGIN_TEST(testWeakMap_setWeakMapEntry_invalid_key) {
 }
 END_TEST(testWeakMap_setWeakMapEntry_invalid_key)
 
-#ifdef NIGHTLY_BUILD
 BEGIN_TEST(testWeakMap_basicOperations_symbols_as_keys) {
   JS::RootedObject map(cx, JS::NewWeakMapObject(cx));
   CHECK(IsWeakMapObject(map));
@@ -142,7 +141,6 @@ BEGIN_TEST(testWeakMap_basicOperations_symbols_as_keys) {
   return true;
 }
 END_TEST(testWeakMap_basicOperations_symbols_as_keys)
-#endif
 
 BEGIN_TEST(testWeakMap_keyDelegates) {
   AutoLeaveZeal nozeal(cx);
@@ -271,16 +269,7 @@ JSObject* newCCW(JS::HandleObject sourceZone, JS::HandleObject destZone) {
 
 JSObject* newDelegate() {
   static const JSClassOps delegateClassOps = {
-      nullptr,                   // addProperty
-      nullptr,                   // delProperty
-      nullptr,                   // enumerate
-      nullptr,                   // newEnumerate
-      nullptr,                   // resolve
-      nullptr,                   // mayResolve
-      nullptr,                   // finalize
-      nullptr,                   // call
-      nullptr,                   // construct
-      JS_GlobalObjectTraceHook,  // trace
+      .trace = JS_GlobalObjectTraceHook,
   };
 
   static const js::ClassExtension delegateClassExtension = {
@@ -311,12 +300,12 @@ JSObject* newDelegate() {
 
 void performIncrementalGC() {
   JSRuntime* rt = cx->runtime();
-  JS::SliceBudget budget(JS::WorkBudget(1000));
+  JS::SliceBudget budget(JS::WorkBudget(200));
   rt->gc.startDebugGC(JS::GCOptions::Normal, budget);
 
-  // Wait until we've started marking before finishing the GC
-  // non-incrementally.
-  while (rt->gc.state() == gc::State::Prepare) {
+  // Wait until we've started sweeping before finishing the GC
+  // non-incrementally otherwise we'll put all zones into one sweep group.
+  while (rt->gc.state() < gc::State::Sweep) {
     rt->gc.debugGCSlice(budget);
   }
   if (JS::IsIncrementalGCInProgress(cx)) {
@@ -324,3 +313,144 @@ void performIncrementalGC() {
   }
 }
 END_TEST(testWeakMap_keyDelegates)
+
+BEGIN_TEST(testWeakMap_traceMappings) {
+  // Test the js::TraceWeakMaps API, used by the cycle collector.
+
+  enum class KeyKind { PlainObject, Delegate, Symbol };
+
+  enum class ValueKind { Object, String, Symbol, Int, Undefined };
+
+  JS::RootedObject map(cx, JS::NewWeakMapObject(cx));
+  CHECK(map);
+  checkNoMappings(map);
+
+  JS::RootedObject set(cx, NewWeakSetObject(cx));
+  CHECK(set);
+  checkNoMappings(set);
+
+  for (KeyKind keyKind :
+       {KeyKind::PlainObject, KeyKind::Delegate, KeyKind::Symbol}) {
+    JS::RootedValue key(cx);
+    switch (keyKind) {
+      case KeyKind::PlainObject: {
+        JSObject* object = JS_NewPlainObject(cx);
+        CHECK(object);
+        key = ObjectValue(*object);
+        break;
+      }
+      case KeyKind::Delegate: {
+        JS::RealmOptions options;
+        JS::RootedObject global(
+            cx, JS_NewGlobalObject(cx, getGlobalClass(), nullptr,
+                                   JS::FireOnNewGlobalHook, options));
+        CHECK(global);
+        key = ObjectValue(*global);
+        CHECK(JS_WrapValue(cx, &key));
+        CHECK(&key.toObject() != global);
+        break;
+      }
+      case KeyKind::Symbol: {
+        JS::Symbol* symbol = JS::NewSymbol(cx, nullptr);
+        CHECK(symbol);
+        key = SymbolValue(symbol);
+        break;
+      }
+    }
+
+    for (ValueKind valueKind :
+         {ValueKind::Object, ValueKind::String, ValueKind::Symbol,
+          ValueKind::Int, ValueKind::Undefined}) {
+      JS::RootedValue value(cx);
+      switch (valueKind) {
+        case ValueKind::Object: {
+          JSObject* object = JS_NewPlainObject(cx);
+          CHECK(object);
+          value = ObjectValue(*object);
+          break;
+        }
+        case ValueKind::String: {
+          JSString* string = JS_NewStringCopyZ(cx, "weak map value");
+          CHECK(string);
+          value = StringValue(string);
+          break;
+        }
+        case ValueKind::Symbol: {
+          JS::Symbol* symbol = JS::NewSymbol(cx, nullptr);
+          CHECK(symbol);
+          value = SymbolValue(symbol);
+          break;
+        }
+        case ValueKind::Int: {
+          value = JS::Int32Value(42);
+          break;
+        }
+        case ValueKind::Undefined: {
+          value = JS::UndefinedValue();
+          break;
+        }
+      }
+
+      JS_GC(cx);
+
+      CHECK(JS::SetWeakMapEntry(cx, map, key, value));
+      CHECK(checkHasMapping(map, key, value));
+
+      CHECK(AddWeakSetEntry(cx, set, key));
+      CHECK(checkHasMapping(set, key, JS::NullHandleValue));
+    }
+
+    key = UndefinedValue();
+    JS_GC(cx);
+    checkNoMappings(map);
+  }
+
+  return true;
+}
+
+struct MappingTracer : public js::WeakMapTracer {
+  JSObject* mapToMatch;
+  JS::GCCellPtr keyToMatch;
+  JS::GCCellPtr valueToMatch;
+  size_t entryCount = 0;
+  size_t matchCount = 0;
+
+  MappingTracer(JSRuntime* rt, JSObject* map, JS::GCCellPtr key,
+                JS::GCCellPtr value)
+      : js::WeakMapTracer(rt),
+        mapToMatch(map),
+        keyToMatch(key),
+        valueToMatch(value) {}
+
+  void trace(JSObject* aMap, JS::GCCellPtr aKey,
+             JS::GCCellPtr aValue) override {
+    if (aMap == mapToMatch) {
+      entryCount++;
+      if (aKey == keyToMatch && aValue == valueToMatch) {
+        matchCount++;
+      }
+    }
+  }
+};
+
+bool checkNoMappings(JS::HandleObject map) {
+  JS_GC(cx);
+  MappingTracer tracer(cx->runtime(), map, JS::GCCellPtr(), JS::GCCellPtr());
+  js::TraceWeakMaps(&tracer);
+  CHECK(tracer.entryCount == 0);
+  CHECK(tracer.matchCount == 0);
+  return true;
+}
+
+bool checkHasMapping(JS::HandleObject map, JS::HandleValue key,
+                     JS::HandleValue value) {
+  JS_GC(cx);
+  MappingTracer tracer(
+      cx->runtime(), map, key.toGCCellPtr(),
+      value.isGCThing() ? value.toGCCellPtr() : JS::GCCellPtr());
+  js::TraceWeakMaps(&tracer);
+  CHECK(tracer.entryCount == 1);
+  CHECK(tracer.matchCount == 1);
+  return true;
+}
+END_TEST(testWeakMap_traceMappings)

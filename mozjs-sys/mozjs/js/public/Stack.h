@@ -1,6 +1,4 @@
-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
- * vim: set ts=8 sts=2 et sw=2 tw=80:
- * This Source Code Form is subject to the terms of the Mozilla Public
+/* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
@@ -108,7 +106,9 @@ struct JS_PUBLIC_API FirstSubsumedFrame {
   FirstSubsumedFrame& operator=(FirstSubsumedFrame&&) = delete;
 
   FirstSubsumedFrame(FirstSubsumedFrame&& rhs)
-      : principals(rhs.principals), ignoreSelfHosted(rhs.ignoreSelfHosted) {
+      : cx(rhs.cx),
+        principals(rhs.principals),
+        ignoreSelfHosted(rhs.ignoreSelfHosted) {
     MOZ_ASSERT(this != &rhs, "self move disallowed");
     rhs.principals = nullptr;
   }

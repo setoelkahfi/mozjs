@@ -1,6 +1,4 @@
-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
- * vim: set ts=8 sts=2 et sw=2 tw=80:
- * This Source Code Form is subject to the terms of the Mozilla Public
+/* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
@@ -12,9 +10,8 @@
 #include "mozilla/Vector.h"  // for Vector
 
 #include <algorithm>
-#include <string.h>     // for size_t, strlen
-#include <type_traits>  // for remove_reference<>::type
-#include <utility>      // for move
+#include <string.h>  // for size_t, strlen
+#include <utility>   // for move
 
 #include "jsapi.h"  // for CallArgs, RootedObject, Rooted
 
@@ -26,6 +23,7 @@
 #include "debugger/Script.h"     // for DebuggerScript
 #include "debugger/Source.h"     // for DebuggerSource
 #include "gc/Tracer.h"        // for TraceManuallyBarrieredCrossCompartmentEdge
+#include "jit/JitOptions.h"   // for jit::HasJitBackend
 #include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
 #include "js/CompilationAndEvaluation.h"  //  for Compile
 #include "js/Conversions.h"               // for ToObject
@@ -86,16 +84,7 @@ using mozilla::Nothing;
 using mozilla::Some;
 
 const JSClassOps DebuggerObject::classOps_ = {
-    nullptr,                          // addProperty
-    nullptr,                          // delProperty
-    nullptr,                          // enumerate
-    nullptr,                          // newEnumerate
-    nullptr,                          // resolve
-    nullptr,                          // mayResolve
-    nullptr,                          // finalize
-    nullptr,                          // call
-    nullptr,                          // construct
-    CallTraceMethod<DebuggerObject>,  // trace
+    .trace = CallTraceMethod<DebuggerObject>,
 };
 
 const JSClass DebuggerObject::class_ = {
@@ -1283,6 +1272,11 @@ bool DebuggerObject::CallData::createSource() {
   }
 
   bool forceEnableAsmJS = ToBoolean(v);
+  if (forceEnableAsmJS && !jit::HasJitBackend()) {
+    JS_ReportErrorASCII(cx,
+                        "forceEnableAsmJS cannot be used with no JIT backend");
+    return false;
+  }
 
   RootedScript script(cx);
   {
@@ -1750,7 +1744,7 @@ bool DebuggerObject::name(JSContext* cx,
     if (!fun->isAccessorWithLazyName()) {
       result.set(fun->fullExplicitName());
       if (result) {
-        cx->markAtom(result);
+        cx->recordRef(result);
       }
       return true;
     }
@@ -1764,7 +1758,7 @@ bool DebuggerObject::name(JSContext* cx,
         return false;
       }
     }
-    cx->markAtom(result);
+    cx->recordRef(result);
     return true;
   }
 
@@ -1792,7 +1786,7 @@ bool DebuggerObject::name(JSContext* cx,
     }
   }
 
-  cx->markAtom(result);
+  cx->recordRef(result);
   return true;
 }
 
@@ -1810,7 +1804,7 @@ bool DebuggerObject::displayName(JSContext* cx,
       }
     }
     if (result) {
-      cx->markAtom(result);
+      cx->recordRef(result);
     }
     return true;
   }
@@ -2112,7 +2106,9 @@ bool DebuggerObject::getOwnPropertyNames(JSContext* cx,
   }
 
   for (size_t i = 0; i < result.length(); i++) {
-    cx->markId(result[i]);
+    if (!cx->wrapOrRecordRefToId(result[i])) {
+      return false;
+    }
   }
 
   return true;
@@ -2174,7 +2170,9 @@ bool DebuggerObject::getOwnPropertySymbols(JSContext* cx,
   }
 
   for (size_t i = 0; i < result.length(); i++) {
-    cx->markAtom(result[i].toSymbol());
+    if (!cx->wrapOrRecordRefToId(result[i])) {
+      return false;
+    }
   }
 
   return true;
@@ -2208,7 +2206,9 @@ bool DebuggerObject::getOwnPrivateProperties(JSContext* cx,
   });
 
   for (size_t i = 0; i < result.length(); i++) {
-    cx->markAtom(result[i].toSymbol());
+    if (!cx->wrapOrRecordRefToId(result[i])) {
+      return false;
+    }
   }
 
   return true;
@@ -2216,7 +2216,7 @@ bool DebuggerObject::getOwnPrivateProperties(JSContext* cx,
 
 /* static */
 bool DebuggerObject::getOwnPropertyDescriptor(
-    JSContext* cx, Handle<DebuggerObject*> object, HandleId id,
+    JSContext* cx, Handle<DebuggerObject*> object, HandleId id_,
     MutableHandle<Maybe<PropertyDescriptor>> desc_) {
   RootedObject referent(cx, object->referent());
   Debugger* dbg = object->owner();
@@ -2226,7 +2226,10 @@ bool DebuggerObject::getOwnPropertyDescriptor(
     Maybe<AutoRealm> ar;
     EnterDebuggeeObjectRealm(cx, ar, referent);
 
-    cx->markId(id);
+    RootedId id(cx, id_);
+    if (!cx->wrapOrRecordRefToId(&id)) {
+      return false;
+    }
 
     ErrorCopier ec(ar);
     if (!GetOwnPropertyDescriptor(cx, referent, id, desc_)) {
@@ -2300,7 +2303,8 @@ bool DebuggerObject::freeze(JSContext* cx, Handle<DebuggerObject*> object) {
 
 /* static */
 bool DebuggerObject::defineProperty(JSContext* cx,
-                                    Handle<DebuggerObject*> object, HandleId id,
+                                    Handle<DebuggerObject*> object,
+                                    HandleId id_,
                                     Handle<PropertyDescriptor> desc_) {
   RootedObject referent(cx, object->referent());
   Debugger* dbg = object->owner();
@@ -2314,10 +2318,10 @@ bool DebuggerObject::defineProperty(JSContext* cx,
   Maybe<AutoRealm> ar;
   EnterDebuggeeObjectRealm(cx, ar, referent);
 
-  if (!cx->compartment()->wrap(cx, &desc)) {
+  RootedId id(cx, id_);
+  if (!cx->compartment()->wrap(cx, &desc) || !cx->wrapOrRecordRefToId(&id)) {
     return false;
   }
-  cx->markId(id);
 
   ErrorCopier ec(ar);
   return DefineProperty(cx, referent, id, desc);
@@ -2326,8 +2330,10 @@ bool DebuggerObject::defineProperty(JSContext* cx,
 /* static */
 bool DebuggerObject::defineProperties(JSContext* cx,
                                       Handle<DebuggerObject*> object,
-                                      Handle<IdVector> ids,
+                                      Handle<IdVector> ids_,
                                       Handle<PropertyDescriptorVector> descs_) {
+  MOZ_ASSERT(ids_.length() == descs_.length());
+
   RootedObject referent(cx, object->referent());
   Debugger* dbg = object->owner();
 
@@ -2342,14 +2348,19 @@ bool DebuggerObject::defineProperties(JSContext* cx,
     JS_TRY_OR_RETURN_FALSE(cx, CheckPropertyDescriptorAccessors(cx, descs[i]));
   }
 
+  Rooted<IdVector> ids(cx, IdVector(cx));
+  if (!ids.append(ids_.begin(), ids_.end())) {
+    return false;
+  }
+
   Maybe<AutoRealm> ar;
   EnterDebuggeeObjectRealm(cx, ar, referent);
 
   for (size_t i = 0; i < descs.length(); i++) {
-    if (!cx->compartment()->wrap(cx, descs[i])) {
+    if (!cx->compartment()->wrap(cx, descs[i]) ||
+        !cx->wrapOrRecordRefToId(ids[i])) {
       return false;
     }
-    cx->markId(ids[i]);
   }
 
   ErrorCopier ec(ar);
@@ -2364,14 +2375,17 @@ bool DebuggerObject::defineProperties(JSContext* cx,
 
 /* static */
 bool DebuggerObject::deleteProperty(JSContext* cx,
-                                    Handle<DebuggerObject*> object, HandleId id,
-                                    ObjectOpResult& result) {
+                                    Handle<DebuggerObject*> object,
+                                    HandleId id_, ObjectOpResult& result) {
   RootedObject referent(cx, object->referent());
 
   Maybe<AutoRealm> ar;
   EnterDebuggeeObjectRealm(cx, ar, referent);
 
-  cx->markId(id);
+  RootedId id(cx, id_);
+  if (!cx->wrapOrRecordRefToId(&id)) {
+    return false;
+  }
 
   ErrorCopier ec(ar);
   return DeleteProperty(cx, referent, id, result);
@@ -2380,7 +2394,7 @@ bool DebuggerObject::deleteProperty(JSContext* cx,
 /* static */
 Result<Completion> DebuggerObject::getProperty(JSContext* cx,
                                                Handle<DebuggerObject*> object,
-                                               HandleId id,
+                                               HandleId id_,
                                                HandleValue receiver_) {
   RootedObject referent(cx, object->referent());
   Debugger* dbg = object->owner();
@@ -2392,16 +2406,18 @@ Result<Completion> DebuggerObject::getProperty(JSContext* cx,
     return cx->alreadyReportedError();
   }
 
+  RootedId id(cx, id_);
+
   // Enter the debuggee compartment and rewrap all input value for that
   // compartment. (Rewrapping always takes place in the destination
   // compartment.)
   Maybe<AutoRealm> ar;
   EnterDebuggeeObjectRealm(cx, ar, referent);
   if (!cx->compartment()->wrap(cx, &referent) ||
-      !cx->compartment()->wrap(cx, &receiver)) {
+      !cx->compartment()->wrap(cx, &receiver) ||
+      !cx->wrapOrRecordRefToId(&id)) {
     return cx->alreadyReportedError();
   }
-  cx->markId(id);
 
   LeaveDebuggeeNoExecute nnx(cx);
 
@@ -2413,10 +2429,12 @@ Result<Completion> DebuggerObject::getProperty(JSContext* cx,
 /* static */
 Result<Completion> DebuggerObject::setProperty(JSContext* cx,
                                                Handle<DebuggerObject*> object,
-                                               HandleId id, HandleValue value_,
+                                               HandleId id_, HandleValue value_,
                                                HandleValue receiver_) {
   RootedObject referent(cx, object->referent());
   Debugger* dbg = object->owner();
+
+  RootedId id(cx, id_);
 
   // Unwrap Debugger.Objects. This happens in the debugger's compartment since
   // that is where any exceptions must be reported.
@@ -2434,10 +2452,10 @@ Result<Completion> DebuggerObject::setProperty(JSContext* cx,
   EnterDebuggeeObjectRealm(cx, ar, referent);
   if (!cx->compartment()->wrap(cx, &referent) ||
       !cx->compartment()->wrap(cx, &value) ||
-      !cx->compartment()->wrap(cx, &receiver)) {
+      !cx->compartment()->wrap(cx, &receiver) ||
+      !cx->wrapOrRecordRefToId(&id)) {
     return cx->alreadyReportedError();
   }
-  cx->markId(id);
 
   LeaveDebuggeeNoExecute nnx(cx);
 
@@ -2561,6 +2579,7 @@ bool DebuggerObject::forceLexicalInitializationByName(
         v.whyMagic() == JS_UNINITIALIZED_LEXICAL) {
       globalLexical->as<NativeObject>().setSlot(propInfo.slot(),
                                                 UndefinedValue());
+      cx->hasDebuggerForcedLexicalInit = true;
       result = true;
     }
   }
